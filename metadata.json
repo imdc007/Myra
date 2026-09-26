@@ -1,0 +1,11 @@
+{
+  "name": "Myra — Dushyant's AI Assistant",
+  "description": "Dushyant's personal AI voice and chat assistant with voice visualization and fluid conversational interface.",
+  "requestFramePermissions": [
+    "microphone",
+    "MICROPHONE"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
