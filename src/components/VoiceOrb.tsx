@@ -1,5 +1,6 @@
 import React from 'react';
 import { VoiceState } from '../types/myra';
+import { audioService } from '../services/audioService';
 
 interface VoiceOrbProps {
   voiceState: VoiceState;
@@ -62,13 +63,18 @@ export const VoiceOrb: React.FC<VoiceOrbProps> = ({
             : 'Start voice conversation with Myra'
         }
         onClick={isInteractive ? onClick : undefined}
+        onTouchStart={() => {
+          if (isInteractive) {
+            audioService.unlockAudio();
+          }
+        }}
         onKeyDown={(e) => {
           if ((e.key === 'Enter' || e.key === ' ') && isInteractive && onClick) {
             e.preventDefault();
             onClick();
           }
         }}
-        className={`relative flex items-center justify-center p-6 sm:p-8 transition-transform duration-500 group outline-none ${
+        className={`relative flex items-center justify-center p-6 sm:p-8 transition-transform duration-500 group outline-none touch-manipulation ${
           isInteractive ? 'cursor-pointer hover:scale-[1.02] active:scale-[0.98]' : 'cursor-wait'
         }`}
       >

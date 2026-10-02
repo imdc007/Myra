@@ -20,6 +20,7 @@ export function useVoiceInteraction({
   const analyserRef = useRef<AnalyserNode | null>(null);
   const animationFrameRef = useRef<number | null>(null);
   const isListeningRef = useRef(false);
+  const isVoiceModeActiveRef = useRef(false);
   const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const latestTranscriptRef = useRef<string>('');
   const hasAudibleSpeechRef = useRef<boolean>(false);
@@ -63,9 +64,21 @@ export function useVoiceInteraction({
         }
         const avg = sum / dataArray.length;
 
-        // If average volume exceeds ambient threshold, record that speech occurred
-        if (avg > 15) {
+        // Dynamic Voice Activity Detection (VAD) for mobile & tablet
+        if (avg > 12) {
           hasAudibleSpeechRef.current = true;
+          // Clear any pending silence timer while user is actively talking
+          if (silenceTimerRef.current) {
+            clearTimeout(silenceTimerRef.current);
+            silenceTimerRef.current = null;
+          }
+        } else if (hasAudibleSpeechRef.current && !silenceTimerRef.current) {
+          // User paused speaking: finalize recording after 1.4s of silence
+          silenceTimerRef.current = setTimeout(() => {
+            if (isListeningRef.current) {
+              finishListeningSession();
+            }
+          }, 1400);
         }
 
         // Dynamic symmetrical audio bars mapped from real frequencies
@@ -124,7 +137,11 @@ export function useVoiceInteraction({
   const handleSpeechComplete = async (transcript: string) => {
     const cleanText = transcript.trim();
     if (!cleanText) {
-      setVoiceState('idle');
+      if (isVoiceModeActiveRef.current) {
+        startListening();
+      } else {
+        setVoiceState('idle');
+      }
       return;
     }
 
@@ -158,28 +175,79 @@ export function useVoiceInteraction({
           setVoiceState('speaking');
         },
         () => {
-          setVoiceState('idle');
+          // CONTINUOUS CONVERSATION LOOP:
+          // If Voice Mode is active, pause 350ms to allow audio hardware transition, then start listening again!
+          if (isVoiceModeActiveRef.current) {
+            setTimeout(() => {
+              if (isVoiceModeActiveRef.current) {
+                startListening();
+              }
+            }, 350);
+          } else {
+            setVoiceState('idle');
+          }
         },
-        () => {
-          setVoiceState('idle');
+        (err) => {
+          console.warn('Audio speech error:', err);
+          if (isVoiceModeActiveRef.current) {
+            setTimeout(() => {
+              if (isVoiceModeActiveRef.current) {
+                startListening();
+              }
+            }, 350);
+          } else {
+            setVoiceState('idle');
+          }
         }
       );
     } catch (err) {
       console.warn('Voice request issue:', err);
       setErrorText('Can you please share your query again?');
-      setVoiceState('error');
+      if (isVoiceModeActiveRef.current) {
+        audioService.speak(
+          'Can you please share your query again?',
+          () => setVoiceState('speaking'),
+          () => {
+            if (isVoiceModeActiveRef.current) {
+              setTimeout(() => {
+                if (isVoiceModeActiveRef.current) {
+                  startListening();
+                }
+              }, 350);
+            } else {
+              setVoiceState('idle');
+            }
+          },
+          () => {
+            if (isVoiceModeActiveRef.current) {
+              setTimeout(() => {
+                if (isVoiceModeActiveRef.current) {
+                  startListening();
+                }
+              }, 350);
+            } else {
+              setVoiceState('idle');
+            }
+          }
+        );
+      } else {
+        setVoiceState('error');
+      }
     }
   };
 
   const finishListeningSession = async () => {
     if (!isListeningRef.current) return;
-    isListeningRef.current = false;
     cleanupTimers();
 
     const recognizedText = latestTranscriptRef.current.trim();
 
     // Check if we already have speech from Web Speech API
     if (recognizedText) {
+      isListeningRef.current = false;
+      latestTranscriptRef.current = '';
+      hasAudibleSpeechRef.current = false;
+      setLiveTranscript('');
       cleanupMic();
       await handleSpeechComplete(recognizedText);
       return;
@@ -187,6 +255,10 @@ export function useVoiceInteraction({
 
     // Only attempt server audio transcription if audible speech was actually detected
     if (hasAudibleSpeechRef.current) {
+      isListeningRef.current = false;
+      latestTranscriptRef.current = '';
+      hasAudibleSpeechRef.current = false;
+      setLiveTranscript('');
       setVoiceState('processing');
       try {
         const recorded = await audioService.stopAndGetRecording();
@@ -203,18 +275,162 @@ export function useVoiceInteraction({
       } catch {
         // Fallback silently without throwing unhandled exceptions
       }
-    } else {
-      cleanupMic();
     }
 
-    // If no words were detected
+    // If no words were detected:
+    // If Voice Mode is selected, DO NOT switch it off automatically. Keep listening!
+    if (isVoiceModeActiveRef.current) {
+      latestTranscriptRef.current = '';
+      setLiveTranscript('');
+      hasAudibleSpeechRef.current = false;
+      if (analyserRef.current) {
+        audioService.initMicrophoneStream().catch(() => {});
+      } else {
+        createAndStartRecognition();
+      }
+      return;
+    }
+
+    isListeningRef.current = false;
     cleanupMic();
     setErrorText("I didn't hear anything. Tap the mic and speak clearly.");
     setVoiceState('idle');
   };
 
+  const createAndStartRecognition = useCallback(() => {
+    if (!isVoiceModeActiveRef.current) return;
+
+    const SpeechRecognition =
+      typeof window !== 'undefined'
+        ? (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
+        : null;
+
+    if (!SpeechRecognition) return;
+
+    // Clean up any stale or terminated instance
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.abort();
+      } catch {
+        // Ignore
+      }
+      recognitionRef.current = null;
+    }
+
+    const isMobileOrTablet =
+      typeof navigator !== 'undefined' &&
+      (/Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) ||
+        (navigator.maxTouchPoints && navigator.maxTouchPoints > 1));
+
+    try {
+      const recognition = new SpeechRecognition();
+      // On mobile / tablet, continuous MUST be false to prevent WebKit speech bugs and freezes
+      recognition.continuous = !isMobileOrTablet;
+      recognition.interimResults = true;
+
+      const devLang =
+        typeof navigator !== 'undefined' && navigator.language ? navigator.language : 'en-US';
+      recognition.lang = devLang.startsWith('hi')
+        ? 'hi-IN'
+        : devLang.includes('IN')
+        ? 'en-IN'
+        : 'en-US';
+
+      recognition.onstart = () => {
+        if (isListeningRef.current) {
+          setVoiceState('listening');
+          setErrorText(null);
+        }
+      };
+
+      recognition.onresult = (event: any) => {
+        if (!isListeningRef.current) return;
+
+        let interim = '';
+        let final = '';
+
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+          const transcript = event.results[i][0].transcript;
+          if (event.results[i].isFinal) {
+            final += transcript + ' ';
+          } else {
+            interim += transcript;
+          }
+        }
+
+        const currentText = (final || interim || '').trim();
+        if (currentText) {
+          latestTranscriptRef.current = currentText;
+          hasAudibleSpeechRef.current = true;
+          setLiveTranscript(currentText);
+
+          // Automatically finalize 1.6s after user stops speaking
+          cleanupTimers();
+          silenceTimerRef.current = setTimeout(() => {
+            finishListeningSession();
+          }, 1600);
+        }
+      };
+
+      recognition.onerror = (event: any) => {
+        console.info('Speech recognition error event:', event.error);
+        if (event.error === 'no-speech') {
+          // Ambient silence - recognition will restart cleanly on onend
+          return;
+        }
+        if (event.error === 'not-allowed') {
+          setIsMicPermissionDenied(true);
+          setErrorText('Microphone permission required. Tap the microphone icon to enable voice.');
+          isVoiceModeActiveRef.current = false;
+          setVoiceState('error');
+          return;
+        }
+        if (event.error === 'audio-capture' || event.error === 'network') {
+          if (isVoiceModeActiveRef.current && isListeningRef.current) {
+            setTimeout(() => {
+              if (isVoiceModeActiveRef.current && isListeningRef.current) {
+                createAndStartRecognition();
+              }
+            }, 350);
+          }
+        }
+      };
+
+      recognition.onend = () => {
+        // If speech was captured, finish and respond
+        if (isListeningRef.current && latestTranscriptRef.current.trim()) {
+          finishListeningSession();
+          return;
+        }
+
+        // CRITICAL FOR CONTINUOUS CONVERSATIONS:
+        // In Web Speech API, a terminated recognition instance CANNOT be restarted with .start().
+        // When silence causes recognition to end, we must spawn a fresh instance!
+        if (isVoiceModeActiveRef.current && isListeningRef.current) {
+          setTimeout(() => {
+            if (isVoiceModeActiveRef.current && isListeningRef.current) {
+              createAndStartRecognition();
+            }
+          }, 200);
+        }
+      };
+
+      recognition.start();
+      recognitionRef.current = recognition;
+    } catch (err) {
+      console.warn('SpeechRecognition initialization error, retrying:', err);
+      if (isVoiceModeActiveRef.current && isListeningRef.current) {
+        setTimeout(() => {
+          if (isVoiceModeActiveRef.current && isListeningRef.current) {
+            createAndStartRecognition();
+          }
+        }, 400);
+      }
+    }
+  }, []);
+
   const startListening = async () => {
-    if (isListeningRef.current) return;
+    if (isListeningRef.current && voiceState === 'listening') return;
     setErrorText(null);
     setIsMicPermissionDenied(false);
     setLiveTranscript('');
@@ -223,7 +439,16 @@ export function useVoiceInteraction({
     cleanupTimers();
     audioService.stop();
 
-    // 1. Initialize microphone stream (MediaDevices + AudioContext + MediaRecorder)
+    // Ensure audio output is unlocked for subsequent speech responses on mobile & tablet
+    audioService.unlockAudio();
+
+    // Mark continuous Voice Mode active
+    isVoiceModeActiveRef.current = true;
+    isListeningRef.current = true;
+    setVoiceState('listening');
+
+    // 1. Initialize microphone stream on all devices (mobile, tablet, PC)
+    // This acquires mic permission, runs the silent gain node to pull live audio data, and starts MediaRecorder
     try {
       const { analyser } = await audioService.initMicrophoneStream();
       analyserRef.current = analyser;
@@ -235,110 +460,57 @@ export function useVoiceInteraction({
         micErr.message?.includes('Permission denied')
       ) {
         setIsMicPermissionDenied(true);
-        setErrorText('Microphone access requires permission. Click the Voice/Mic icon or allow microphone in your browser settings.');
+        setErrorText('Microphone permission required. Tap the microphone icon and allow access in your browser.');
+        isVoiceModeActiveRef.current = false;
         setVoiceState('error');
         return;
       } else if (micErr.name === 'NotFoundError' || micErr.name === 'DevicesNotFoundError') {
-        setErrorText('No microphone detected on this device. You can type or tap sample queries.');
+        setErrorText('No microphone detected on this device. You can type in the chat box.');
+        isVoiceModeActiveRef.current = false;
         setVoiceState('error');
         return;
       }
     }
 
-    isListeningRef.current = true;
-    setVoiceState('listening');
-
-    // 2. Initialize Web Speech API for real-time transcription if supported
+    // 2. Also start Web Speech recognition if supported by browser
     const SpeechRecognition =
-      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+      typeof window !== 'undefined'
+        ? (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
+        : null;
 
     if (SpeechRecognition) {
-      try {
-        const recognition = new SpeechRecognition();
-        recognition.continuous = true;
-        recognition.interimResults = true;
-        recognition.lang = 'en-US';
-
-        recognition.onstart = () => {
-          if (isListeningRef.current) {
-            setVoiceState('listening');
-            setErrorText(null);
-          }
-        };
-
-        recognition.onresult = (event: any) => {
-          if (!isListeningRef.current) return;
-
-          let interim = '';
-          let final = '';
-
-          for (let i = event.resultIndex; i < event.results.length; ++i) {
-            const transcript = event.results[i][0].transcript;
-            if (event.results[i].isFinal) {
-              final += transcript + ' ';
-            } else {
-              interim += transcript;
-            }
-          }
-
-          const currentText = (final || interim || '').trim();
-          if (currentText) {
-            latestTranscriptRef.current = currentText;
-            setLiveTranscript(currentText);
-
-            // Silence detection: automatically finalize after 1.8s of silence after speaking
-            cleanupTimers();
-            silenceTimerRef.current = setTimeout(() => {
-              finishListeningSession();
-            }, 1800);
-          }
-        };
-
-        recognition.onerror = (event: any) => {
-          console.info('Speech recognition event:', event.error);
-          if (event.error === 'not-allowed') {
-            // If SpeechRecognition failed because of iframe restriction or browser policy,
-            // the MediaRecorder will still capture audio and transcribe on stop
-            console.info('Speech recognition permission restricted; keeping audio stream active for transcription.');
-          }
-        };
-
-        recognition.onend = () => {
-          // If still listening and speech was captured, finish session
-          if (isListeningRef.current && latestTranscriptRef.current.trim()) {
-            finishListeningSession();
-          }
-        };
-
-        recognition.start();
-        recognitionRef.current = recognition;
-      } catch (e) {
-        console.info('SpeechRecognition start notice:', e);
-      }
+      createAndStartRecognition();
     }
-
-    // Safety timeout: max 15 seconds per voice utterance if user forgets to stop
-    silenceTimerRef.current = setTimeout(() => {
-      if (isListeningRef.current) {
-        finishListeningSession();
-      }
-    }, 15000);
   };
 
-  const stopListening = () => {
-    finishListeningSession();
-  };
+  const stopVoiceMode = useCallback(() => {
+    isVoiceModeActiveRef.current = false;
+    isListeningRef.current = false;
+    cleanupTimers();
+    cleanupMic();
+    audioService.stop();
+    setVoiceState('idle');
+    setLiveTranscript('');
+    latestTranscriptRef.current = '';
+  }, [cleanupMic]);
 
-  const toggleVoiceInteraction = () => {
+  const startVoiceMode = useCallback(() => {
+    audioService.unlockAudio();
+    isVoiceModeActiveRef.current = true;
+    startListening();
+  }, []);
+
+  const toggleVoiceInteraction = useCallback(() => {
+    audioService.unlockAudio();
     if (voiceState === 'listening') {
-      stopListening();
-    } else if (voiceState === 'speaking') {
-      audioService.stop();
-      setVoiceState('idle');
+      // If user taps while listening, finalize and process speech immediately!
+      finishListeningSession();
+    } else if (voiceState === 'speaking' || isVoiceModeActiveRef.current) {
+      stopVoiceMode();
     } else {
-      startListening();
+      startVoiceMode();
     }
-  };
+  }, [voiceState, startVoiceMode, stopVoiceMode]);
 
   // Allows triggering a simulated or sample voice query directly
   const simulateVoiceQuery = async (queryText: string) => {
@@ -372,8 +544,9 @@ export function useVoiceInteraction({
     liveTranscript,
     audioLevels,
     startListening,
-    stopListening,
+    stopListening: stopVoiceMode,
     toggleVoiceInteraction,
     simulateVoiceQuery,
+    isVoiceModeActive: isVoiceModeActiveRef.current,
   };
 }

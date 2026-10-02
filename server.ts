@@ -2,8 +2,11 @@ import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import fs from 'fs';
+import os from 'os';
 import dotenv from 'dotenv';
 import { GoogleGenAI } from '@google/genai';
+import { EdgeTTS } from 'node-edge-tts';
 
 dotenv.config();
 
@@ -202,6 +205,123 @@ Guidelines:
     return generateDeterministicAssistantResponse(userText, sessionId, inputMode);
   }
 
+  // In-memory cache for synthesized neural audio chunks
+  const ttsAudioCache = new Map<string, Buffer>();
+
+  // High-fidelity neural TTS endpoint for authentic Hindi-origin female voices
+  const handleTTS = async (req: express.Request, res: express.Response) => {
+    try {
+      const text = String(req.query.text || req.body?.text || '').trim();
+      const voice = String(req.query.voice || req.body?.voice || 'neerja-expressive').toLowerCase();
+
+      if (!text) {
+        return res.status(400).send('Missing text parameter');
+      }
+
+      // Clean formatting characters for smooth audio speech
+      const cleanText = text
+        .replace(/[*#_`]/g, '')
+        .replace(/•/g, ', ')
+        .replace(/\[.*?\]\(.*?\)/g, '')
+        .slice(0, 1000)
+        .trim();
+
+      const hasHindiDevanagari = /[\u0900-\u097F]/.test(cleanText);
+
+      const cacheKey = `${voice}:${hasHindiDevanagari ? 'hi:' : ''}${cleanText}`;
+      if (ttsAudioCache.has(cacheKey)) {
+        const cached = ttsAudioCache.get(cacheKey)!;
+        res.setHeader('Content-Type', 'audio/mpeg');
+        res.setHeader('Content-Length', String(cached.length));
+        res.setHeader('Cache-Control', 'public, max-age=86400');
+        return res.send(cached);
+      }
+
+      let audioBuffer: Buffer | null = null;
+
+      if (voice === 'google-hi' || voice === 'google-hindi' || (hasHindiDevanagari && voice.includes('google'))) {
+        const url = `https://translate.google.com/translate_tts?ie=UTF-8&tl=hi&client=tw-ob&q=${encodeURIComponent(cleanText)}`;
+        const gRes = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+        if (gRes.ok) {
+          audioBuffer = Buffer.from(await gRes.arrayBuffer());
+        }
+      } else if (voice === 'google-en-in' || voice === 'google-english-india') {
+        const url = `https://translate.google.com/translate_tts?ie=UTF-8&tl=en-IN&client=tw-ob&q=${encodeURIComponent(cleanText)}`;
+        const gRes = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+        if (gRes.ok) {
+          audioBuffer = Buffer.from(await gRes.arrayBuffer());
+        }
+      } else {
+        // High-Fidelity Microsoft Neural Voices:
+        // 'swara' -> 'hi-IN-SwaraNeural'
+        // 'neerja-professional' -> 'en-IN-NeerjaNeural'
+        // 'neerja-expressive' / default -> 'en-IN-NeerjaExpressiveNeural'
+        // CRITICAL NOTE: Microsoft Neerja (en-IN) has an English phoneme table and outputs 0 bytes for Devanagari script.
+        // If Devanagari script is detected, we route to Microsoft's native Hindi female voice (hi-IN-SwaraNeural).
+        let edgeVoice = 'en-IN-NeerjaExpressiveNeural';
+        if (hasHindiDevanagari || voice.includes('swara') || voice === 'hi-in-swaraneural' || voice.includes('hindi')) {
+          edgeVoice = 'hi-IN-SwaraNeural';
+        } else if (voice.includes('professional') || voice.includes('pro') || voice === 'en-in-neerjaneural') {
+          edgeVoice = 'en-IN-NeerjaNeural';
+        }
+
+        try {
+          const tts = new EdgeTTS({ voice: edgeVoice });
+          const tmpFile = path.join(os.tmpdir(), `tts_${Date.now()}_${Math.random().toString(36).slice(2)}.mp3`);
+          await Promise.race([
+            tts.ttsPromise(cleanText, tmpFile),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('EdgeTTS timeout after 3000ms')), 3000)),
+          ]);
+
+          if (fs.existsSync(tmpFile)) {
+            const stats = fs.statSync(tmpFile);
+            if (stats.size > 0) {
+              audioBuffer = fs.readFileSync(tmpFile);
+            }
+            try {
+              fs.unlinkSync(tmpFile);
+            } catch {
+              // Ignore unlink errors
+            }
+          }
+        } catch (edgeErr: any) {
+          console.warn('[Server /api/tts] EdgeTTS error, falling back to Google TTS:', edgeErr.message);
+        }
+
+        // Automatic secondary fallback to Google TTS if edgeTTS produced 0 bytes
+        if (!audioBuffer || audioBuffer.length === 0) {
+          const targetLang = hasHindiDevanagari ? 'hi' : 'en-IN';
+          const url = `https://translate.google.com/translate_tts?ie=UTF-8&tl=${targetLang}&client=tw-ob&q=${encodeURIComponent(cleanText)}`;
+          const gRes = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+          if (gRes.ok) {
+            audioBuffer = Buffer.from(await gRes.arrayBuffer());
+          }
+        }
+      }
+
+      if (!audioBuffer || audioBuffer.length === 0) {
+        return res.status(502).send('Failed to generate speech audio');
+      }
+
+      if (ttsAudioCache.size > 150) {
+        const firstKey = ttsAudioCache.keys().next().value;
+        if (firstKey) ttsAudioCache.delete(firstKey);
+      }
+      ttsAudioCache.set(cacheKey, audioBuffer);
+
+      res.setHeader('Content-Type', 'audio/mpeg');
+      res.setHeader('Content-Length', String(audioBuffer.length));
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      return res.send(audioBuffer);
+    } catch (err: any) {
+      console.warn('[Server /api/tts] Synthesis failed:', err.message);
+      return res.status(500).send('TTS synthesis error: ' + err.message);
+    }
+  };
+
+  app.get('/api/tts', handleTTS);
+  app.post('/api/tts', handleTTS);
+
   // Support GET /api/myra gracefully
   app.get('/api/myra', (_req, res) => {
     return res.status(200).json({
@@ -359,7 +479,7 @@ Guidelines:
   app.post('/api/transcribe', async (req, res) => {
     try {
       const { audioData, mimeType } = req.body;
-      if (!audioData || typeof audioData !== 'string' || audioData.trim().length < 2500) {
+      if (!audioData || typeof audioData !== 'string' || audioData.trim().length < 100) {
         return res.status(200).json({ text: '' });
       }
 

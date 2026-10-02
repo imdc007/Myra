@@ -1,6 +1,6 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { ChatMessage } from '../types/myra';
-import { Volume2 } from 'lucide-react';
+import { Volume2, Square, Loader2 } from 'lucide-react';
 import { audioService } from '../services/audioService';
 
 interface ChatMessageItemProps {
@@ -11,13 +11,55 @@ export const ChatMessageItem: React.FC<ChatMessageItemProps> = ({
   message,
 }) => {
   const isUser = message.sender === 'user';
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
 
-  const handleSpeakAloud = () => {
-    if (audioService.getIsSpeaking()) {
+  useEffect(() => {
+    // Subscribe to stop events so if another message starts or stop is clicked, this resets
+    const unsubscribe = audioService.onStop(() => {
+      setIsPlaying(false);
+      setIsLoading(false);
+    });
+    return unsubscribe;
+  }, []);
+
+  const handleSpeakAloud = (e: React.MouseEvent<HTMLButtonElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+
+    // CRITICAL FOR MOBILE & TABLET: Synchronous unlock during user tap event!
+    audioService.unlockAudio();
+
+    if (isPlaying || isLoading) {
       audioService.stop();
-    } else {
-      audioService.speak(message.text);
+      setIsPlaying(false);
+      setIsLoading(false);
+      return;
     }
+
+    setIsLoading(true);
+
+    audioService.speak(
+      message.text,
+      () => {
+        setIsLoading(false);
+        setIsPlaying(true);
+      },
+      () => {
+        setIsLoading(false);
+        setIsPlaying(false);
+      },
+      (err) => {
+        console.warn('Read aloud playback error:', err);
+        setIsLoading(false);
+        setIsPlaying(false);
+      }
+    );
+  };
+
+  const handleTouchStart = () => {
+    // Pre-unlock audio context on mobile/tablet touchstart before click fires
+    audioService.unlockAudio();
   };
 
   return (
@@ -33,12 +75,26 @@ export const ChatMessageItem: React.FC<ChatMessageItemProps> = ({
 
         {!isUser && (
           <button
+            type="button"
             onClick={handleSpeakAloud}
-            title="Read aloud"
-            aria-label="Read response aloud"
-            className="p-1 text-gray-400 hover:text-indigo-600 rounded-md transition-colors"
+            onTouchStart={handleTouchStart}
+            title={isPlaying ? 'Stop reading' : isLoading ? 'Loading voice...' : 'Read aloud'}
+            aria-label={isPlaying ? 'Stop reading response' : 'Read response aloud'}
+            className={`min-w-[36px] min-h-[36px] p-2 flex items-center justify-center rounded-full transition-all cursor-pointer touch-manipulation active:scale-90 ${
+              isPlaying
+                ? 'bg-indigo-50 text-indigo-600 ring-1 ring-indigo-200/90 shadow-2xs'
+                : isLoading
+                ? 'bg-indigo-50/60 text-indigo-600'
+                : 'text-gray-400 hover:text-indigo-600 hover:bg-gray-100 active:bg-gray-200'
+            }`}
           >
-            <Volume2 className="w-3.5 h-3.5" />
+            {isLoading ? (
+              <Loader2 className="w-4 h-4 animate-spin text-indigo-600" />
+            ) : isPlaying ? (
+              <Square className="w-3.5 h-3.5 fill-indigo-600 text-indigo-600" />
+            ) : (
+              <Volume2 className="w-4 h-4" />
+            )}
           </button>
         )}
       </div>
